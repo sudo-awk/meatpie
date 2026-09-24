@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# MeatPi Dual CAN Setup  —  by Jerold
+# idVendor=16d0  idProduct=1261
+
+set -euo pipefail
+
+# --- Config ------------------------------------------------------------------
+VENDOR_ID="16d0"
+PRODUCT_ID="1261"
+BAUD_RATE=115200
+SLCAND_SPEED_FLAG="s6"   # s5=250k  s6=500k  s8=1000k
+CAN_BITRATE=500000
+TIMEOUT=10
+# -----------------------------------------------------------------------------
+
+log()   { echo "[INFO]  $*"; }
+ok()    { echo "[ OK ]  $*"; }
+warn()  { echo "[WARN]  $*"; }
+error() { echo "[ERR ]  $*" >&2; }
+die()   { error "$*"; exit 1; }
+
+print_header() {
+    echo ""
+    echo "  __  __            _   ____  _ "
+    echo " |  \/  | ___  __ _| |_|  _ \(_)"
+    echo " | |\/| |/ _ \/ _\` | __| |_) | |"
+    echo " | |  | |  __/ (_| | |_|  __/| |"
+    echo " |_|  |_|\___|\__,_|\__|_|   |_|"
+    echo ""
+    echo "  MeatPi Dual CAN  |  ${VENDOR_ID}:${PRODUCT_ID}  |  ${CAN_BITRATE} bps"
+    echo ""
+}
+
+print_coffee() {
+    echo "  If this saved you time, buy me a coffee!"
+    echo ""
+    echo "      ( ("
+    echo "       ) )"
+    echo "     ........"
+    echo "     |      |]"
+    echo "     \      /"
+    echo "      \`----'"
+    echo ""
+    echo "  https://buymeacoffee.com/jerold"
+    echo ""
+}
+
+usage() {
+    print_header
+    echo "  Usage:  $(basename "$0") <command>"
+    echo ""
+    echo "  Commands:"
+    echo "    up      Detect ports, configure ACM, bring up canN interfaces"
+    echo "    down    Tear down MeatPi canN interfaces and stop slcand"
+    echo "    status  Show interface, slcand, and USB state"
+    echo ""
+    echo "  Config (edit top of script):"
+    echo "    BAUD_RATE         = ${BAUD_RATE}"
+    echo "    SLCAND_SPEED_FLAG = ${SLCAND_SPEED_FLAG}  (s5=250k  s6=500k  s8=1000k)"
+    echo "    CAN_BITRATE       = ${CAN_BITRATE}"
+    echo ""
+    echo "  Note: CAN index starts after any existing can* interfaces,"
+    echo "  so other devices (can0, can1 ...) are never overwritten."
+    echo ""
+    print_coffee
+    exit 0
+}
+
+# =============================================================================
+# Device discovery
+# =============================================================================
+
+find_usb_device_path() {
+    for dev in /sys/bus/usb/devices/*/; do
+        local vid pid
+        vid=$(cat "${dev}idVendor" 2>/dev/null || true)
+        pid=$(cat "${dev}idProduct" 2>/dev/null || true)
+        if [[ "$vid" == "$VENDOR_ID" && "$pid" == "$PRODUCT_ID" ]]; then
+            echo "$dev"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_acm_ports() {
+    local usb_path="$1"
+    local ports=()
+
+    for tty in "${usb_path}"*/tty/tty*/; do
+        local name
+        name=$(basename "$tty" 2>/dev/null || true)
+        [[ "$name" == ttyACM* ]] && ports+=("/dev/$name")
+    done
+
+    if [[ ${#ports[@]} -eq 0 ]]; then
+        local canon_path
+        canon_path=$(realpath "$usb_path")
+        for acm in /sys/class/tty/ttyACM*/; do
+            local link_path
+            link_path=$(realpath "$acm" 2>/dev/null || true)
+            if [[ "$link_path" == *"${canon_path##*/}"* ]]; then
+                ports+=("/dev/$(basename "$acm")")
+            fi
+        done
+    fi
+
+    printf '%s\n' "${ports[@]}" | sort
+}
+
+wait_for_device() {
+    log "Waiting up to ${TIMEOUT}s for MeatPi (${VENDOR_ID}:${PRODUCT_ID}) ..."
+    local elapsed=0
+    while (( elapsed < TIMEOUT )); do
+        find_usb_device_path &>/dev/null && { ok "Device found."; return 0; }
+        sleep 1
+        elapsed=$(( elapsed + 1 ))
+    done
+    die "Device not found after ${TIMEOUT}s. Is it plugged in?"
+}
+
+next_free_can_index() {
+    local idx=0
+    while ip link show "can${idx}" &>/dev/null 2>&1; do
+        idx=$(( idx + 1 ))
+    done
+    echo "$idx"
+}
+
+# =============================================================================
+# ACM / SocketCAN helpers
+# =============================================================================
+
+configure_acm() {
+    local port="$1" iface="$2"
+    [[ -c "$port" ]] || { error "$port does not exist."; return 1; }
+    log "Configuring $port -> $iface ..."
+    if [[ ! -r "$port" || ! -w "$port" ]]; then
+        warn "$port not accessible -- fixing permissions for this session ..."
+        warn "Permanent fix:  sudo usermod -aG dialout $USER  (then re-login)"
+        sudo chmod a+rw "$port"
+    fi
+    stty -F "$port" "${BAUD_RATE}" cs8 -cstopb -parenb -crtscts raw -echo -echoe -echok
+    ok "$port configured at ${BAUD_RATE} baud (raw)"
+}
+
+teardown_iface() {
+    local port="$1" iface="$2"
+    local devname="${port##*/}"
+    if pgrep -f "slcand.*${devname}" &>/dev/null; then
+        log "Stopping slcand on $port ..."
+        sudo pkill -f "slcand.*${devname}" || true
+        sleep 0.5
+    fi
+    if ip link show "$iface" &>/dev/null 2>&1; then
+        log "Bringing down $iface ..."
+        sudo ip link set "$iface" down 2>/dev/null || true
+        sleep 0.3
+    fi
+}
+
+setup_socketcan() {
+    local port="$1" iface="$2"
+    command -v slcand &>/dev/null || { warn "slcand not found -- sudo apt install can-utils"; return 1; }
+    teardown_iface "$port" "$iface"
+    log "Starting slcand: $port -> $iface ..."
+    sudo slcand -o -c -"${SLCAND_SPEED_FLAG}" -S "${BAUD_RATE}" "$port" "$iface"
+    sleep 0.5
+    sudo ip link set "$iface" up
+    ok "$iface UP (${CAN_BITRATE} bps <- $port)"
+}
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+cmd_up() {
+    print_header
+    wait_for_device
+
+    local usb_path
+    usb_path=$(find_usb_device_path)
+    log "USB device at: $usb_path"
+
+    mapfile -t ports < <(find_acm_ports "$usb_path")
+    [[ ${#ports[@]} -eq 0 ]] && die "No ttyACM ports found. Try:  sudo modprobe cdc_acm"
+    log "Detected ${#ports[@]} ACM port(s): ${ports[*]}"
+
+    local start_idx
+    start_idx=$(next_free_can_index)
+    (( start_idx > 0 )) && warn "can0..can$(( start_idx - 1 )) already in use -- MeatPi starts at can${start_idx}"
+
+    local ifaces=()
+    local idx=$start_idx
+    for port in "${ports[@]}"; do
+        local iface="can${idx}"
+        configure_acm "$port" "$iface"
+        setup_socketcan "$port" "$iface"
+        ifaces+=("$iface")
+        idx=$(( idx + 1 ))
+    done
+
+    echo ""
+    echo "  All interfaces UP"
+    echo "  ----------------"
+    for i in "${!ports[@]}"; do
+        echo "    ${ifaces[$i]}  <->  ${ports[$i]}"
+    done
+    echo ""
+    echo "  candump ${ifaces[0]}"
+    [[ ${#ifaces[@]} -gt 1 ]] && echo "  candump ${ifaces[1]}"
+    echo "  cansend ${ifaces[0]} 7DF#0201050000000000"
+    echo ""
+    print_coffee
+}
+
+cmd_down() {
+    print_header
+
+    local ports=()
+    if find_usb_device_path &>/dev/null; then
+        local usb_path
+        usb_path=$(find_usb_device_path)
+        mapfile -t ports < <(find_acm_ports "$usb_path")
+    fi
+
+    if [[ ${#ports[@]} -eq 0 ]]; then
+        warn "USB device not detected -- looking for orphaned slcand processes ..."
+        mapfile -t ports < <(pgrep -af slcand 2>/dev/null \
+            | grep -oP '/dev/ttyACM\d+' | sort -u || true)
+    fi
+
+    local torn_down=false
+    for port in "${ports[@]}"; do
+        local devname="${port##*/}"
+        local iface
+        iface=$(pgrep -af "slcand.*${devname}" 2>/dev/null \
+            | grep -oP 'can\d+' | head -1 || true)
+        if [[ -n "$iface" ]]; then
+            teardown_iface "$port" "$iface"
+            ok "$iface down ($port released)"
+            torn_down=true
+        else
+            warn "No slcand found for $port -- skipping."
+        fi
+    done
+
+    if pgrep -f slcand &>/dev/null; then
+        warn "Orphaned slcand process(es) found -- killing ..."
+        sudo pkill -f slcand || true
+        torn_down=true
+    fi
+
+    echo ""
+    if [[ "$torn_down" == true ]]; then
+        echo "  All interfaces DOWN"
+    else
+        echo "  Nothing was running."
+    fi
+    echo ""
+}
+
+cmd_status() {
+    print_header
+
+    echo "  USB Device"
+    if find_usb_device_path &>/dev/null; then
+        local usb_path
+        usb_path=$(find_usb_device_path)
+        echo "    [+] Present  ($usb_path)"
+        mapfile -t ports < <(find_acm_ports "$usb_path")
+        if [[ ${#ports[@]} -gt 0 ]]; then
+            echo "    ttyACM ports: ${ports[*]}"
+        else
+            echo "    No ttyACM ports found"
+        fi
+    else
+        echo "    [-] Not detected  (${VENDOR_ID}:${PRODUCT_ID})"
+    fi
+
+    echo ""
+    echo "  slcand Processes"
+    local slcand_lines
+    slcand_lines=$(pgrep -af slcand 2>/dev/null | grep -v grep || true)
+    if [[ -n "$slcand_lines" ]]; then
+        while IFS= read -r line; do
+            echo "    [+] $line"
+        done <<< "$slcand_lines"
+    else
+        echo "    (none running)"
+    fi
+
+    echo ""
+    echo "  CAN Interfaces"
+    local any=false
+    for iface in $(ip -brief link show type can 2>/dev/null | awk '{print $1}' || true); do
+        local state
+        state=$(ip -brief link show "$iface" | awk '{print $2}')
+        local backing
+        backing=$(pgrep -af "slcand.*${iface}" 2>/dev/null \
+            | grep -oP '/dev/ttyACM\d+' | head -1 || true)
+        local backing_str=""
+        [[ -n "$backing" ]] && backing_str="  <-  $backing"
+        echo "    [${state}] ${iface}${backing_str}"
+        any=true
+    done
+    [[ "$any" == false ]] && echo "    (no CAN interfaces found)"
+
+    echo ""
+}
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+case "${1:-}" in
+    up)             cmd_up     ;;
+    down)           cmd_down   ;;
+    status)         cmd_status ;;
+    -h|--help|help) usage      ;;
+    "")             usage      ;;
+    *)              error "Unknown command: $1"; usage ;;
+esac
