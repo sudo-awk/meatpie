@@ -48,4 +48,5 @@ CAN index starts after any existing `can*` interfaces, so other devices (`can0`,
 
 ---
 
-If this saved you time, buy me a coffee: https://buymeacoffee.com/jerold
+If this saved you time, buy me a coffee: https://buymeacoffee.com/
+
